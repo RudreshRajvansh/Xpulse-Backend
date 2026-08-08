@@ -1,0 +1,189 @@
+use crate::models::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub fn six_digit_code() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{:06}", 100_000 + (nanos % 900_000))
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Db {
+    pub accounts: Vec<Account>,
+    pub medicines: HashMap<String, Vec<Medicine>>,
+    pub allergies: HashMap<String, Vec<String>>,
+    pub grants: Vec<AccessGrant>,
+    pub audit: Vec<AuditEntry>,
+    pub prescriptions: Vec<Prescription>,
+    pub appointments: Vec<Appointment>,
+    pub lab_orders: Vec<LabOrder>,
+    pub tickets: Vec<SupportTicket>,
+    pub profiles: HashMap<String, PatientProfile>,
+    pub reports: Vec<MedicalReport>,
+    pub reset_codes: HashMap<String, String>,
+    pub sessions: HashMap<String, String>,
+    pub reception_token: Option<String>,
+}
+
+impl Db {
+    pub fn name_of(&self, user_id: &str) -> String {
+        self.accounts
+            .iter()
+            .find(|a| a.user.id == user_id)
+            .map(|a| a.user.name.clone())
+            .unwrap_or_else(|| "Patient".to_string())
+    }
+
+    pub fn push_audit(&mut self, actor: &str, action: &str, subject_id: &str) {
+        self.audit.push(AuditEntry {
+            id: new_id(),
+            actor: actor.to_string(),
+            action: action.to_string(),
+            subject_id: subject_id.to_string(),
+            timestamp: now_millis(),
+        });
+    }
+
+    fn seed() -> Self {
+        let mut db = Db::default();
+        let staff = [
+            ("u_patient", "Aarav Sharma", "patient@xpulse.in", "PATIENT", None),
+            ("u_doctor", "Dr. Mehta", "doctor@xpulse.in", "DOCTOR", Some("fac_1")),
+            ("u_reception", "Priya Nair", "reception@xpulse.in", "RECEPTIONIST", Some("fac_1")),
+            ("u_pharmacy", "MedPlus Pharmacy", "pharmacy@xpulse.in", "PHARMACY", Some("fac_1")),
+            ("u_diagnostic", "City Diagnostics", "diagnostic@xpulse.in", "DIAGNOSTIC", Some("fac_1")),
+            ("u_admin", "Area Admin", "admin@xpulse.in", "ADMIN", Some("area_1")),
+            ("u_super_admin", "Super Admin", "superadmin@xpulse.in", "SUPER_ADMIN", None),
+            ("u_customer_care", "Support Desk", "care@xpulse.in", "CUSTOMER_CARE", None),
+        ];
+        for (id, name, email, role, scope) in staff {
+            db.accounts.push(Account {
+                user: User {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    email: email.to_string(),
+                    roles: vec![role.to_string()],
+                    scope_id: scope.map(|s| s.to_string()),
+                    phone: None,
+                },
+                password_hash: crate::password::hash("password"),
+            });
+        }
+
+        db.medicines.insert(
+            "u_patient".to_string(),
+            vec![
+                Medicine {
+                    id: "m1".to_string(),
+                    name: "Metformin 500mg".to_string(),
+                    dose: "1 tablet".to_string(),
+                    frequency: "Twice daily".to_string(),
+                    is_prn: false,
+                },
+                Medicine {
+                    id: "m2".to_string(),
+                    name: "Telmisartan 40mg".to_string(),
+                    dose: "1 tablet".to_string(),
+                    frequency: "Once daily".to_string(),
+                    is_prn: false,
+                },
+            ],
+        );
+
+        db.allergies.insert(
+            "u_patient".to_string(),
+            vec!["Penicillin".to_string(), "Sulfa drugs".to_string()],
+        );
+
+        db.profiles.insert(
+            "u_patient".to_string(),
+            PatientProfile {
+                age: "34".to_string(),
+                city: "Pune".to_string(),
+                height_cm: "174".to_string(),
+                weight_kg: "78".to_string(),
+                conditions: vec!["Diabetes".to_string()],
+                abha_connected: false,
+                insurance_connected: false,
+                onboarded: true,
+            },
+        );
+
+        let now = now_millis();
+        db.lab_orders.push(LabOrder {
+            id: "lab_seed_1".to_string(),
+            patient_id: "u_patient".to_string(),
+            patient_name: "Aarav Sharma".to_string(),
+            test_name: "HbA1c".to_string(),
+            ordered_by: "u_doctor".to_string(),
+            ordered_at: now - 86_400_000,
+            status: "COMPLETED".to_string(),
+            result_summary: Some("6.8% · slightly above target range".to_string()),
+            completed_at: Some(now - 43_200_000),
+        });
+        db.lab_orders.push(LabOrder {
+            id: "lab_seed_2".to_string(),
+            patient_id: "u_patient".to_string(),
+            patient_name: "Aarav Sharma".to_string(),
+            test_name: "Lipid Profile".to_string(),
+            ordered_at: now - 3_600_000,
+            ordered_by: "u_doctor".to_string(),
+            status: "ORDERED".to_string(),
+            result_summary: None,
+            completed_at: None,
+        });
+
+        db
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    inner: Arc<Mutex<Db>>,
+    path: PathBuf,
+}
+
+impl AppState {
+    pub fn load(path: PathBuf) -> Self {
+        let db = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Db>(&raw).ok())
+            .unwrap_or_else(Db::seed);
+        AppState {
+            inner: Arc::new(Mutex::new(db)),
+            path,
+        }
+    }
+
+    pub fn read<T>(&self, f: impl FnOnce(&Db) -> T) -> T {
+        let guard = self.inner.lock().expect("store poisoned");
+        f(&guard)
+    }
+
+    pub fn write<T>(&self, f: impl FnOnce(&mut Db) -> T) -> T {
+        let mut guard = self.inner.lock().expect("store poisoned");
+        let out = f(&mut guard);
+        if let Ok(raw) = serde_json::to_string_pretty(&*guard) {
+            let _ = std::fs::write(&self.path, raw);
+        }
+        out
+    }
+}

@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: xpulse-backend
+    runtime: rust
+    plan: free
+    buildCommand: cargo build --release
+    startCommand: ./target/release/xpulse-backend
+    healthCheckPath: /health
