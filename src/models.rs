@@ -57,6 +57,8 @@ pub struct AccessGrant {
 pub struct AuditEntry {
     pub id: String,
     pub actor: String,
+    #[serde(default)]
+    pub actor_name: String,
     pub action: String,
     pub subject_id: String,
     pub timestamp: i64,

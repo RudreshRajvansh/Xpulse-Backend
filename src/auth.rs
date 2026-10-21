@@ -19,6 +19,7 @@ pub const ROLE_CUSTOMER_CARE: &str = "CUSTOMER_CARE";
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: String,
+    pub name: String,
     pub roles: Vec<String>,
     pub token: String,
 }
@@ -70,6 +71,7 @@ pub async fn require_auth(
             .find(|a| a.user.id == session.user_id)
             .map(|a| AuthUser {
                 id: a.user.id.clone(),
+                name: a.user.name.clone(),
                 roles: a.user.roles.clone(),
                 token: token.clone(),
             })

@@ -74,7 +74,7 @@ pub fn authorize_record(state: &AppState, auth: &AuthUser, patient_id: &str, sco
             } else {
                 format!("Was denied {}: no active consent", label(scope))
             };
-            db.push_audit(&auth.id, &action, patient_id);
+            db.push_audit(auth, &action, patient_id);
         }
         if granted {
             Ok(())

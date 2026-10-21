@@ -1,3 +1,4 @@
+use crate::auth::AuthUser;
 use crate::models::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -151,10 +152,11 @@ impl Db {
             .unwrap_or_else(|| "Patient".to_string())
     }
 
-    pub fn push_audit(&mut self, actor: &str, action: &str, subject_id: &str) {
+    pub fn push_audit(&mut self, actor: &AuthUser, action: &str, subject_id: &str) {
         self.audit.push(AuditEntry {
             id: new_id(),
-            actor: actor.to_string(),
+            actor: actor.id.clone(),
+            actor_name: actor.name.clone(),
             action: action.to_string(),
             subject_id: subject_id.to_string(),
             timestamp: now_millis(),

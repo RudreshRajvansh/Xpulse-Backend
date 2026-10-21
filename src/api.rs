@@ -270,7 +270,7 @@ async fn issue_prescription(
             .or_default()
             .extend(items.clone());
         let names = items.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ");
-        db.push_audit(&auth.id, &format!("Prescribed {names}"), &body.patient_id);
+        db.push_audit(&auth, &format!("Prescribed {names}"), &body.patient_id);
         let prescription = Prescription {
             id: new_id(),
             patient_id: body.patient_id.clone(),
@@ -311,7 +311,7 @@ async fn fulfill_prescription(
             .ok_or_else(|| ApiError::NotFound("Prescription not found".into()))?;
         db.prescriptions[index].fulfilled = true;
         let updated = db.prescriptions[index].clone();
-        db.push_audit("Pharmacy", "Fulfilled a prescription", &updated.patient_id);
+        db.push_audit(&auth, "Dispensed a prescription", &updated.patient_id);
         Ok(Json(updated))
     })
 }
@@ -359,7 +359,7 @@ async fn grant_access(
         };
         db.grants.push(grant.clone());
         db.push_audit(
-            &auth.id,
+            &auth,
             &format!("Granted {} access to {}", grantee.name, describe(&scope)),
             &body.patient_id,
         );
@@ -383,7 +383,8 @@ async fn revoke_grant(
         }
         db.grants[index].revoked = true;
         let updated = db.grants[index].clone();
-        db.push_audit("You", "Revoked access", &updated.patient_id);
+        let grantee = db.name_of(&updated.grantee_id);
+        db.push_audit(&auth, &format!("Revoked {grantee}'s access"), &updated.patient_id);
         Ok(Json(updated))
     })
 }
@@ -401,15 +402,15 @@ async fn verify_grant(
             .cloned()
             .ok_or_else(|| ApiError::NotFound("Grant not found".into()))?;
         if grant.grantee_id != auth.id {
-            db.push_audit(&auth.id, "Tried to open a consent issued to someone else", &grant.patient_id);
+            db.push_audit(&auth, "Tried to open a consent issued to someone else", &grant.patient_id);
             return Err(ApiError::Forbidden("This consent was not granted to you".into()));
         }
         if grant.revoked || now_millis() >= grant.expires_at {
-            db.push_audit(&auth.id, "Was denied a revoked or expired consent", &grant.patient_id);
+            db.push_audit(&auth, "Was denied a revoked or expired consent", &grant.patient_id);
             return Err(ApiError::Forbidden("This consent has been revoked or has expired".into()));
         }
         db.push_audit(
-            &auth.id,
+            &auth,
             &format!("Opened shared {}", describe(&grant.scope)),
             &grant.patient_id,
         );
@@ -491,7 +492,6 @@ async fn reception_token(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckInBody {
-    patient_id: String,
     token: String,
 }
 
@@ -500,7 +500,8 @@ async fn check_in(
     Extension(auth): Extension<AuthUser>,
     Json(body): Json<CheckInBody>,
 ) -> ApiResult<Json<Appointment>> {
-    auth.require_self(&body.patient_id)?;
+    auth.require(&[ROLE_PATIENT])?;
+    let patient_id = auth.id.clone();
     state.write(|db| {
         let active = db
             .reception_token
@@ -509,17 +510,17 @@ async fn check_in(
         if body.token.trim() != active {
             return Err(ApiError::InvalidInput("That code does not match the reception desk".into()));
         }
-        if db.appointments.iter().any(|a| a.patient_id == body.patient_id) {
+        if db.appointments.iter().any(|a| a.patient_id == patient_id) {
             return Err(ApiError::Conflict("You are already in the queue".into()));
         }
         let appointment = Appointment {
             id: new_id(),
-            patient_id: body.patient_id.clone(),
-            patient_name: db.name_of(&body.patient_id),
+            patient_id: patient_id.clone(),
+            patient_name: auth.name.clone(),
             checked_in_at: now_millis(),
         };
         db.appointments.push(appointment.clone());
-        db.push_audit("Reception", "Checked in at the front desk", &body.patient_id);
+        db.push_audit(&auth, "Checked in at the front desk", &patient_id);
         Ok(Json(appointment))
     })
 }
@@ -549,7 +550,7 @@ async fn admit(
             .position(|a| a.id == id)
             .ok_or_else(|| ApiError::NotFound("Appointment not found".into()))?;
         let appointment = db.appointments.remove(index);
-        db.push_audit("Reception", "Admitted for consultation", &appointment.patient_id);
+        db.push_audit(&auth, "Admitted for consultation", &appointment.patient_id);
         Ok(Json(appointment))
     })
 }
@@ -585,7 +586,7 @@ async fn order_lab_test(
             completed_at: None,
         };
         db.lab_orders.push(order.clone());
-        db.push_audit(&auth.id, &format!("Ordered lab test: {test_name}"), &body.patient_id);
+        db.push_audit(&auth, &format!("Ordered lab test: {test_name}"), &body.patient_id);
         Ok(Json(order))
     })
 }
@@ -637,7 +638,7 @@ async fn collect_sample(
         db.lab_orders[index].status = "SAMPLE_COLLECTED".to_string();
         let updated = db.lab_orders[index].clone();
         db.push_audit(
-            "Diagnostics",
+            &auth,
             &format!("Collected sample for {}", updated.test_name),
             &updated.patient_id,
         );
@@ -672,7 +673,7 @@ async fn complete_lab_order(
         db.lab_orders[index].completed_at = Some(now_millis());
         let updated = db.lab_orders[index].clone();
         db.push_audit(
-            "Diagnostics",
+            &auth,
             &format!("Published report for {}", updated.test_name),
             &updated.patient_id,
         );
@@ -766,7 +767,6 @@ async fn create_staff(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RaiseTicketBody {
-    user_id: String,
     subject: String,
     detail: String,
 }
@@ -776,12 +776,11 @@ async fn raise_ticket(
     Extension(auth): Extension<AuthUser>,
     Json(body): Json<RaiseTicketBody>,
 ) -> ApiResult<Json<SupportTicket>> {
-    auth.require_self(&body.user_id)?;
     Ok(Json(state.write(|db| {
         let ticket = SupportTicket {
             id: new_id(),
-            raised_by: body.user_id.clone(),
-            raised_by_name: db.name_of(&body.user_id),
+            raised_by: auth.id.clone(),
+            raised_by_name: auth.name.clone(),
             subject: body.subject.clone(),
             detail: body.detail.clone(),
             status: "OPEN".to_string(),
@@ -790,7 +789,7 @@ async fn raise_ticket(
             resolved_at: None,
         };
         db.tickets.push(ticket.clone());
-        db.push_audit("You", "Raised a support ticket", &body.user_id);
+        db.push_audit(&auth, "Raised a support ticket", &auth.id);
         ticket
     })))
 }
@@ -850,7 +849,7 @@ async fn resolve_ticket(
         db.tickets[index].resolution = Some(body.resolution.clone());
         db.tickets[index].resolved_at = Some(now_millis());
         let updated = db.tickets[index].clone();
-        db.push_audit("Support", "Resolved your support ticket", &updated.raised_by);
+        db.push_audit(&auth, "Resolved a support ticket", &updated.raised_by);
         Ok(Json(updated))
     })
 }
@@ -950,7 +949,7 @@ async fn add_report(
             added_at: now_millis(),
         };
         db.reports.push(report.clone());
-        db.push_audit("You", &format!("Uploaded a {} report", body.category), &id);
+        db.push_audit(&auth, &format!("Uploaded a {} report", body.category), &id);
         report
     })))
 }
