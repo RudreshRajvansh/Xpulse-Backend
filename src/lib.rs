@@ -8,6 +8,7 @@ pub mod recommend;
 pub mod storage;
 pub mod store;
 pub mod tls;
+pub mod validate;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;

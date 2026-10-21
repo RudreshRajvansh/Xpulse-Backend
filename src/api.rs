@@ -4,6 +4,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::models::*;
 use crate::password;
 use crate::store::{AppState, ResetCode, new_id, now_millis, random_code};
+use crate::validate;
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
@@ -89,21 +90,25 @@ struct RegisterBody {
 }
 
 async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>) -> ApiResult<Json<Value>> {
-    if state.read(|db| db.account_by_email(&body.email).is_some()) {
+    let name = validate::name(&body.name)?;
+    let email = validate::email(&body.email)?;
+    let phone = validate::phone(&body.phone)?;
+    validate::password(&body.password)?;
+    if state.read(|db| db.account_by_email(&email).is_some()) {
         return Err(ApiError::Conflict("An account with this email already exists".into()));
     }
-    let password_hash = password::hash_async(body.password.clone()).await;
+    let password_hash = password::hash_async(body.password).await;
     let user = state.write(|db| {
-        if db.account_by_email(&body.email).is_some() {
+        if db.account_by_email(&email).is_some() {
             return Err(ApiError::Conflict("An account with this email already exists".into()));
         }
         let user = User {
             id: format!("u_{}", new_id()),
-            name: body.name.clone(),
-            email: body.email.clone(),
+            name,
+            email,
             roles: vec![ROLE_PATIENT.to_string()],
             scope_id: None,
-            phone: Some(body.phone.clone()),
+            phone: Some(phone),
         };
         db.accounts.push(Account {
             user: user.clone(),
@@ -163,6 +168,7 @@ struct ResetBody {
 }
 
 async fn reset_password(State(state): State<AppState>, Json(body): Json<ResetBody>) -> ApiResult<Json<Value>> {
+    validate::password(&body.new_password)?;
     let email = body.email.trim().to_lowercase();
     let otp = body.otp.trim().to_string();
     let user_id = state.write_volatile(|db| {
@@ -659,6 +665,7 @@ async fn complete_lab_order(
     Json(body): Json<CompleteLabBody>,
 ) -> ApiResult<Json<LabOrder>> {
     auth.require(&[ROLE_DIAGNOSTIC])?;
+    let summary = validate::required(&body.result_summary, "Result summary", 2000)?;
     state.write(|db| {
         let index = db
             .lab_orders
@@ -668,8 +675,11 @@ async fn complete_lab_order(
         if db.lab_orders[index].status == "COMPLETED" {
             return Err(ApiError::Conflict("Report already published".into()));
         }
+        if db.lab_orders[index].status != "SAMPLE_COLLECTED" {
+            return Err(ApiError::Conflict("Collect the sample before publishing a result".into()));
+        }
         db.lab_orders[index].status = "COMPLETED".to_string();
-        db.lab_orders[index].result_summary = Some(body.result_summary.clone());
+        db.lab_orders[index].result_summary = Some(summary);
         db.lab_orders[index].completed_at = Some(now_millis());
         let updated = db.lab_orders[index].clone();
         db.push_audit(
@@ -740,20 +750,33 @@ async fn create_staff(
     Json(body): Json<CreateStaffBody>,
 ) -> ApiResult<Json<User>> {
     auth.require(&[ROLE_SUPER_ADMIN])?;
-    if state.read(|db| db.account_by_email(&body.email).is_some()) {
+    let role = body.role.trim().to_string();
+    if !CREATABLE_STAFF_ROLES.contains(&role.as_str()) {
+        return Err(ApiError::InvalidInput("That role cannot be assigned to a new account".into()));
+    }
+    let name = validate::name(&body.name)?;
+    let email = validate::email(&body.email)?;
+    validate::password(&body.password)?;
+    let scope_id = body
+        .scope_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if state.read(|db| db.account_by_email(&email).is_some()) {
         return Err(ApiError::Conflict("An account with this email already exists".into()));
     }
-    let password_hash = password::hash_async(body.password.clone()).await;
+    let password_hash = password::hash_async(body.password).await;
     state.write(|db| {
-        if db.account_by_email(&body.email).is_some() {
+        if db.account_by_email(&email).is_some() {
             return Err(ApiError::Conflict("An account with this email already exists".into()));
         }
         let user = User {
             id: format!("u_{}", new_id()),
-            name: body.name.clone(),
-            email: body.email.clone(),
-            roles: vec![body.role.clone()],
-            scope_id: body.scope_id.clone(),
+            name,
+            email,
+            roles: vec![role],
+            scope_id,
             phone: None,
         };
         db.accounts.push(Account {
@@ -776,13 +799,15 @@ async fn raise_ticket(
     Extension(auth): Extension<AuthUser>,
     Json(body): Json<RaiseTicketBody>,
 ) -> ApiResult<Json<SupportTicket>> {
+    let subject = validate::required(&body.subject, "Subject", 200)?;
+    let detail = validate::required(&body.detail, "Detail", 4000)?;
     Ok(Json(state.write(|db| {
         let ticket = SupportTicket {
             id: new_id(),
             raised_by: auth.id.clone(),
             raised_by_name: auth.name.clone(),
-            subject: body.subject.clone(),
-            detail: body.detail.clone(),
+            subject,
+            detail,
             status: "OPEN".to_string(),
             created_at: now_millis(),
             resolution: None,
@@ -836,6 +861,7 @@ async fn resolve_ticket(
     Json(body): Json<ResolveTicketBody>,
 ) -> ApiResult<Json<SupportTicket>> {
     auth.require(&[ROLE_CUSTOMER_CARE])?;
+    let resolution = validate::required(&body.resolution, "Resolution", 4000)?;
     state.write(|db| {
         let index = db
             .tickets
@@ -846,7 +872,7 @@ async fn resolve_ticket(
             return Err(ApiError::Conflict("Ticket already resolved".into()));
         }
         db.tickets[index].status = "RESOLVED".to_string();
-        db.tickets[index].resolution = Some(body.resolution.clone());
+        db.tickets[index].resolution = Some(resolution);
         db.tickets[index].resolved_at = Some(now_millis());
         let updated = db.tickets[index].clone();
         db.push_audit(&auth, "Resolved a support ticket", &updated.raised_by);
@@ -926,6 +952,12 @@ async fn add_report(
     Json(body): Json<AddReportBody>,
 ) -> ApiResult<Json<MedicalReport>> {
     auth.require_self(&id)?;
+    let category = validate::required(&body.category, "Category", 40)?;
+    let label = if body.label.trim().is_empty() {
+        category.clone()
+    } else {
+        validate::required(&body.label, "Label", 120)?
+    };
     let report_id = new_id();
     let mut file_bytes = 0usize;
     let mut stored = false;
@@ -939,17 +971,13 @@ async fn add_report(
             patient_id: id.clone(),
             file_bytes,
             stored,
-            category: body.category.clone(),
-            label: if body.label.trim().is_empty() {
-                body.category.clone()
-            } else {
-                body.label.clone()
-            },
+            category: category.clone(),
+            label,
             uri: body.uri.clone(),
             added_at: now_millis(),
         };
         db.reports.push(report.clone());
-        db.push_audit(&auth, &format!("Uploaded a {} report", body.category), &id);
+        db.push_audit(&auth, &format!("Uploaded a {category} report"), &id);
         report
     })))
 }

@@ -16,6 +16,15 @@ pub const ROLE_ADMIN: &str = "ADMIN";
 pub const ROLE_SUPER_ADMIN: &str = "SUPER_ADMIN";
 pub const ROLE_CUSTOMER_CARE: &str = "CUSTOMER_CARE";
 
+pub const CREATABLE_STAFF_ROLES: [&str; 6] = [
+    ROLE_DOCTOR,
+    ROLE_RECEPTIONIST,
+    ROLE_PHARMACY,
+    ROLE_DIAGNOSTIC,
+    ROLE_ADMIN,
+    ROLE_CUSTOMER_CARE,
+];
+
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: String,
