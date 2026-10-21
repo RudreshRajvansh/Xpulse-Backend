@@ -1,4 +1,5 @@
 use crate::auth::*;
+use crate::consent::*;
 use crate::error::{ApiError, ApiResult};
 use crate::models::*;
 use crate::password;
@@ -206,7 +207,7 @@ async fn get_medicines(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<Medicine>>> {
-    auth.require_self_or_staff(&id)?;
+    authorize_record(&state, &auth, &id, SCOPE_MEDICINES)?;
     Ok(Json(state.read(|db| db.medicines.get(&id).cloned().unwrap_or_default())))
 }
 
@@ -215,7 +216,7 @@ async fn get_audit(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<AuditEntry>>> {
-    auth.require_self_or_staff(&id)?;
+    auth.require_self(&id)?;
     Ok(Json(state.read(|db| {
         let mut items: Vec<AuditEntry> = db.audit.iter().filter(|e| e.subject_id == id).cloned().collect();
         items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -227,8 +228,19 @@ async fn get_audit(
 #[serde(rename_all = "camelCase")]
 struct IssuePrescriptionBody {
     patient_id: String,
-    doctor_id: String,
-    items: Vec<Medicine>,
+    items: Vec<PrescribedItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrescribedItem {
+    name: String,
+    #[serde(default)]
+    dose: String,
+    #[serde(default)]
+    frequency: String,
+    #[serde(default)]
+    is_prn: bool,
 }
 
 async fn issue_prescription(
@@ -237,24 +249,40 @@ async fn issue_prescription(
     Json(body): Json<IssuePrescriptionBody>,
 ) -> ApiResult<Json<Prescription>> {
     auth.require(&[ROLE_DOCTOR])?;
-    Ok(Json(state.write(|db| {
+    if body.items.is_empty() || body.items.iter().any(|item| item.name.trim().is_empty()) {
+        return Err(ApiError::InvalidInput("Every prescribed item needs a medicine name".into()));
+    }
+    let items: Vec<Medicine> = body
+        .items
+        .iter()
+        .map(|item| Medicine {
+            id: new_id(),
+            name: item.name.trim().to_string(),
+            dose: item.dose.trim().to_string(),
+            frequency: item.frequency.trim().to_string(),
+            is_prn: item.is_prn,
+        })
+        .collect();
+    state.write(|db| {
+        require_consent(db, &auth, &body.patient_id, SCOPE_MEDICINES)?;
         db.medicines
             .entry(body.patient_id.clone())
             .or_default()
-            .extend(body.items.clone());
-        db.push_audit(&body.doctor_id, "Issued a prescription", &body.patient_id);
+            .extend(items.clone());
+        let names = items.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ");
+        db.push_audit(&auth.id, &format!("Prescribed {names}"), &body.patient_id);
         let prescription = Prescription {
             id: new_id(),
             patient_id: body.patient_id.clone(),
             patient_name: db.name_of(&body.patient_id),
-            doctor_id: body.doctor_id.clone(),
-            items: body.items.clone(),
+            doctor_id: auth.id.clone(),
+            items,
             issued_at: now_millis(),
             fulfilled: false,
         };
         db.prescriptions.push(prescription.clone());
-        prescription
-    })))
+        Ok(Json(prescription))
+    })
 }
 
 async fn pending_prescriptions(
@@ -302,21 +330,41 @@ async fn grant_access(
     Extension(auth): Extension<AuthUser>,
     Json(body): Json<GrantBody>,
 ) -> ApiResult<Json<AccessGrant>> {
+    auth.require(&[ROLE_PATIENT])?;
     auth.require_self(&body.patient_id)?;
-    Ok(Json(state.write(|db| {
+    let scope = normalise_scope(&body.scope)?;
+    let now = now_millis();
+    if body.expires_at <= now {
+        return Err(ApiError::InvalidInput("Consent must expire in the future".into()));
+    }
+    let expires_at = body.expires_at.min(now + MAX_GRANT_MS);
+    state.write(|db| {
+        let grantee = db
+            .accounts
+            .iter()
+            .find(|a| a.user.id == body.grantee_id)
+            .map(|a| a.user.clone())
+            .ok_or_else(|| ApiError::InvalidInput("That clinician does not exist".into()))?;
+        if !grantee.roles.iter().any(|role| role == ROLE_DOCTOR) {
+            return Err(ApiError::InvalidInput("Consent can only be granted to a doctor".into()));
+        }
         let grant = AccessGrant {
             id: new_id(),
             patient_id: body.patient_id.clone(),
-            grantee_id: body.grantee_id.clone(),
-            scope: body.scope.clone(),
-            issued_at: now_millis(),
-            expires_at: body.expires_at,
+            grantee_id: grantee.id.clone(),
+            scope: scope.clone(),
+            issued_at: now,
+            expires_at,
             revoked: false,
         };
         db.grants.push(grant.clone());
-        db.push_audit("You", "Granted access", &body.patient_id);
-        grant
-    })))
+        db.push_audit(
+            &auth.id,
+            &format!("Granted {} access to {}", grantee.name, describe(&scope)),
+            &body.patient_id,
+        );
+        Ok(Json(grant))
+    })
 }
 
 async fn revoke_grant(
@@ -353,32 +401,50 @@ async fn verify_grant(
             .cloned()
             .ok_or_else(|| ApiError::NotFound("Grant not found".into()))?;
         if grant.grantee_id != auth.id {
+            db.push_audit(&auth.id, "Tried to open a consent issued to someone else", &grant.patient_id);
             return Err(ApiError::Forbidden("This consent was not granted to you".into()));
         }
-        if grant.revoked || now_millis() > grant.expires_at {
-            db.push_audit(&grant.grantee_id, "Access denied", &grant.patient_id);
-            return Err(ApiError::Unauthorized("Access denied".into()));
+        if grant.revoked || now_millis() >= grant.expires_at {
+            db.push_audit(&auth.id, "Was denied a revoked or expired consent", &grant.patient_id);
+            return Err(ApiError::Forbidden("This consent has been revoked or has expired".into()));
         }
-        db.push_audit(&grant.grantee_id, "Viewed shared health record", &grant.patient_id);
-        let mut lab_orders: Vec<LabOrder> = db
-            .lab_orders
-            .iter()
-            .filter(|o| o.patient_id == grant.patient_id)
-            .cloned()
-            .collect();
+        db.push_audit(
+            &auth.id,
+            &format!("Opened shared {}", describe(&grant.scope)),
+            &grant.patient_id,
+        );
+        let patient_id = grant.patient_id.as_str();
+        let has = |scope: &str| grant.scope.iter().any(|s| s == scope);
+        let mut lab_orders: Vec<LabOrder> = if has(SCOPE_LAB_RESULTS) {
+            db.lab_orders.iter().filter(|o| o.patient_id == patient_id).cloned().collect()
+        } else {
+            Vec::new()
+        };
         lab_orders.sort_by(|a, b| b.ordered_at.cmp(&a.ordered_at));
-        let mut reports: Vec<MedicalReport> = db
-            .reports
-            .iter()
-            .filter(|r| r.patient_id == grant.patient_id)
-            .cloned()
-            .collect();
+        let mut reports: Vec<MedicalReport> = if has(SCOPE_REPORTS) {
+            db.reports.iter().filter(|r| r.patient_id == patient_id).cloned().collect()
+        } else {
+            Vec::new()
+        };
         reports.sort_by(|a, b| b.added_at.cmp(&a.added_at));
         Ok(Json(ScopedData {
-            patient_name: db.name_of(&grant.patient_id),
-            medicines: db.medicines.get(&grant.patient_id).cloned().unwrap_or_default(),
-            allergies: db.allergies.get(&grant.patient_id).cloned().unwrap_or_default(),
-            profile: db.profiles.get(&grant.patient_id).cloned().unwrap_or_default(),
+            patient_name: db.name_of(patient_id),
+            scope: grant.scope.clone(),
+            medicines: if has(SCOPE_MEDICINES) {
+                db.medicines.get(patient_id).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            allergies: if has(SCOPE_ALLERGIES) {
+                db.allergies.get(patient_id).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            profile: if has(SCOPE_PROFILE) {
+                db.profiles.get(patient_id).cloned().unwrap_or_default()
+            } else {
+                PatientProfile::default()
+            },
             lab_orders,
             reports,
         }))
@@ -493,7 +559,6 @@ async fn admit(
 struct OrderLabBody {
     patient_id: String,
     test_name: String,
-    ordered_by: String,
 }
 
 async fn order_lab_test(
@@ -502,26 +567,27 @@ async fn order_lab_test(
     Json(body): Json<OrderLabBody>,
 ) -> ApiResult<Json<LabOrder>> {
     auth.require(&[ROLE_DOCTOR])?;
-    Ok(Json(state.write(|db| {
+    let test_name = body.test_name.trim().to_string();
+    if test_name.is_empty() {
+        return Err(ApiError::InvalidInput("Name the test to order".into()));
+    }
+    state.write(|db| {
+        require_consent(db, &auth, &body.patient_id, SCOPE_LAB_RESULTS)?;
         let order = LabOrder {
             id: new_id(),
             patient_id: body.patient_id.clone(),
             patient_name: db.name_of(&body.patient_id),
-            test_name: body.test_name.clone(),
-            ordered_by: body.ordered_by.clone(),
+            test_name: test_name.clone(),
+            ordered_by: auth.id.clone(),
             ordered_at: now_millis(),
             status: "ORDERED".to_string(),
             result_summary: None,
             completed_at: None,
         };
         db.lab_orders.push(order.clone());
-        db.push_audit(
-            &body.ordered_by,
-            &format!("Ordered lab test: {}", body.test_name),
-            &body.patient_id,
-        );
-        order
-    })))
+        db.push_audit(&auth.id, &format!("Ordered lab test: {test_name}"), &body.patient_id);
+        Ok(Json(order))
+    })
 }
 
 async fn all_lab_orders(
@@ -545,7 +611,7 @@ async fn patient_lab_orders(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<LabOrder>>> {
-    auth.require_self_or_staff(&id)?;
+    authorize_record(&state, &auth, &id, SCOPE_LAB_RESULTS)?;
     Ok(Json(state.read(|db| {
         let mut items: Vec<LabOrder> = db.lab_orders.iter().filter(|o| o.patient_id == id).cloned().collect();
         items.sort_by(|a, b| b.ordered_at.cmp(&a.ordered_at));
@@ -750,7 +816,7 @@ async fn patient_tickets(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<SupportTicket>>> {
-    auth.require_self_or_staff(&id)?;
+    auth.require_self(&id)?;
     Ok(Json(state.read(|db| {
         let mut items: Vec<SupportTicket> = db.tickets.iter().filter(|t| t.raised_by == id).cloned().collect();
         items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -794,7 +860,7 @@ async fn recommendations(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<Recommendation>>> {
-    auth.require_self_or_staff(&id)?;
+    auth.require_self(&id)?;
     Ok(Json(state.read(|db| {
         let profile = db.profiles.get(&id).cloned().unwrap_or_default();
         let medicines = db.medicines.get(&id).cloned().unwrap_or_default();
@@ -813,7 +879,7 @@ async fn get_profile(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<PatientProfile>> {
-    auth.require_self_or_staff(&id)?;
+    authorize_record(&state, &auth, &id, SCOPE_PROFILE)?;
     Ok(Json(state.read(|db| db.profiles.get(&id).cloned().unwrap_or_default())))
 }
 
@@ -835,7 +901,7 @@ async fn get_reports(
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<MedicalReport>>> {
-    auth.require_self_or_staff(&id)?;
+    authorize_record(&state, &auth, &id, SCOPE_REPORTS)?;
     Ok(Json(state.read(|db| {
         let mut items: Vec<MedicalReport> = db.reports.iter().filter(|r| r.patient_id == id).cloned().collect();
         items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
@@ -896,7 +962,7 @@ async fn download_report(
 ) -> ApiResult<Vec<u8>> {
     let owner = state.read(|db| db.reports.iter().find(|r| r.id == id).map(|r| r.patient_id.clone()));
     let patient_id = owner.ok_or_else(|| ApiError::NotFound("Report not found".into()))?;
-    auth.require_self_or_staff(&patient_id)?;
+    authorize_record(&state, &auth, &patient_id, SCOPE_REPORTS)?;
     crate::storage::read_upload(&id).ok_or_else(|| ApiError::NotFound("No file stored for this report".into()))
 }
 

@@ -127,6 +127,17 @@ pub struct Db {
 }
 
 impl Db {
+    pub fn active_grant(&self, patient_id: &str, grantee_id: &str, scope: &str) -> Option<&AccessGrant> {
+        let now = now_millis();
+        self.grants.iter().find(|g| {
+            g.patient_id == patient_id
+                && g.grantee_id == grantee_id
+                && !g.revoked
+                && g.expires_at > now
+                && g.scope.iter().any(|s| s == scope)
+        })
+    }
+
     pub fn account_by_email(&self, email: &str) -> Option<&Account> {
         let wanted = email.trim();
         self.accounts.iter().find(|a| a.user.email.eq_ignore_ascii_case(wanted))

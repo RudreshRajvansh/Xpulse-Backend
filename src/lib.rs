@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod consent;
 pub mod error;
 pub mod models;
 pub mod password;

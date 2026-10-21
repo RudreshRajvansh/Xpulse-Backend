@@ -28,23 +28,11 @@ impl AuthUser {
         self.roles.iter().any(|r| allowed.contains(&r.as_str()))
     }
 
-    pub fn is_staff(&self) -> bool {
-        !self.roles.iter().any(|r| r == ROLE_PATIENT)
-    }
-
     pub fn require(&self, allowed: &[&str]) -> Result<(), ApiError> {
         if self.has_any(allowed) {
             Ok(())
         } else {
             Err(ApiError::Forbidden("Your role cannot perform this action".into()))
-        }
-    }
-
-    pub fn require_self_or_staff(&self, patient_id: &str) -> Result<(), ApiError> {
-        if self.id == patient_id || self.is_staff() {
-            Ok(())
-        } else {
-            Err(ApiError::Forbidden("You can only access your own record".into()))
         }
     }
 

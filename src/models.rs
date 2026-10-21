@@ -139,6 +139,7 @@ pub struct MedicalReport {
 #[serde(rename_all = "camelCase")]
 pub struct ScopedData {
     pub patient_name: String,
+    pub scope: Vec<String>,
     pub medicines: Vec<Medicine>,
     pub allergies: Vec<String>,
     pub profile: PatientProfile,
