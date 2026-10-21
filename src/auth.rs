@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use crate::store::AppState;
+use crate::store::{AppState, now_millis};
 use axum::{
     extract::{Request, State},
     http::header::AUTHORIZATION,
@@ -20,6 +20,7 @@ pub const ROLE_CUSTOMER_CARE: &str = "CUSTOMER_CARE";
 pub struct AuthUser {
     pub id: String,
     pub roles: Vec<String>,
+    pub token: String,
 }
 
 impl AuthUser {
@@ -70,16 +71,20 @@ pub async fn require_auth(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::Unauthorized("Missing session token".into()))?;
 
-    let auth_user = state.read(|db| {
-        db.sessions.get(&token).and_then(|user_id| {
-            db.accounts
-                .iter()
-                .find(|a| &a.user.id == user_id)
-                .map(|a| AuthUser {
-                    id: a.user.id.clone(),
-                    roles: a.user.roles.clone(),
-                })
-        })
+    let auth_user = state.write_volatile(|db| {
+        let session = db.sessions.get(&token).cloned()?;
+        if session.expires_at <= now_millis() {
+            db.sessions.remove(&token);
+            return None;
+        }
+        db.accounts
+            .iter()
+            .find(|a| a.user.id == session.user_id)
+            .map(|a| AuthUser {
+                id: a.user.id.clone(),
+                roles: a.user.roles.clone(),
+                token: token.clone(),
+            })
     });
 
     let auth_user = auth_user.ok_or_else(|| ApiError::Unauthorized("Session expired, sign in again".into()))?;

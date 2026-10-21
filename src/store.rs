@@ -25,13 +25,31 @@ pub fn random_code() -> String {
 
 pub type ResetCodeSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
-#[derive(Clone, Default)]
+pub const DEFAULT_SESSION_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+
+#[derive(Clone)]
 pub struct Config {
     pub reset_code_sink: Option<ResetCodeSink>,
+    pub session_ttl_ms: i64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            reset_code_sink: None,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+        }
+    }
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        let session_ttl_ms = std::env::var("XPULSE_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(|secs| secs * 1000)
+            .unwrap_or(DEFAULT_SESSION_TTL_MS);
         let dev_mode = std::env::var("XPULSE_DEV").map(|v| v == "1").unwrap_or(false);
         let sink: Option<ResetCodeSink> = if dev_mode {
             Some(Arc::new(|email: &str, code: &str| {
@@ -40,8 +58,17 @@ impl Config {
         } else {
             None
         };
-        Config { reset_code_sink: sink }
+        Config {
+            reset_code_sink: sink,
+            session_ttl_ms,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub user_id: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +121,8 @@ pub struct Db {
     pub reports: Vec<MedicalReport>,
     #[serde(skip)]
     pub reset_codes: HashMap<String, ResetCode>,
-    pub sessions: HashMap<String, String>,
+    #[serde(skip)]
+    pub sessions: HashMap<String, Session>,
     pub reception_token: Option<String>,
 }
 
@@ -273,6 +301,23 @@ impl AppState {
     pub fn write_volatile<T>(&self, f: impl FnOnce(&mut Db) -> T) -> T {
         let mut guard = self.inner.lock().expect("store poisoned");
         f(&mut guard)
+    }
+
+    pub fn issue_session(&self, user_id: &str) -> String {
+        let ttl = self.config.session_ttl_ms;
+        self.write_volatile(|db| {
+            let now = now_millis();
+            db.sessions.retain(|_, session| session.expires_at > now);
+            let token = new_id();
+            db.sessions.insert(
+                token.clone(),
+                Session {
+                    user_id: user_id.to_string(),
+                    expires_at: now + ttl,
+                },
+            );
+            token
+        })
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&Db) -> T) -> T {

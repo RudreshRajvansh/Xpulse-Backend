@@ -46,6 +46,13 @@ impl TestApp {
         }
     }
 
+    pub fn with_session_ttl(ttl_ms: i64) -> Self {
+        Self::with_config(Config {
+            session_ttl_ms: ttl_ms,
+            ..Config::default()
+        })
+    }
+
     pub fn with_inbox() -> (Self, Inbox) {
         let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
         let delivered = inbox.clone();

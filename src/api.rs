@@ -74,11 +74,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginBody>) -> Ap
         Some(account) if matched => account,
         _ => return Err(ApiError::Unauthorized("Invalid email or password".into())),
     };
-    let token = state.write(|db| {
-        let token = new_id();
-        db.sessions.insert(token.clone(), account.user.id.clone());
-        token
-    });
+    let token = state.issue_session(&account.user.id);
     Ok(Json(json!({ "token": token, "user": account.user })))
 }
 
@@ -96,7 +92,7 @@ async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>)
         return Err(ApiError::Conflict("An account with this email already exists".into()));
     }
     let password_hash = password::hash_async(body.password.clone()).await;
-    state.write(|db| {
+    let user = state.write(|db| {
         if db.account_by_email(&body.email).is_some() {
             return Err(ApiError::Conflict("An account with this email already exists".into()));
         }
@@ -112,15 +108,15 @@ async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>)
             user: user.clone(),
             password_hash,
         });
-        let token = new_id();
-        db.sessions.insert(token.clone(), user.id.clone());
-        Ok(Json(json!({ "token": token, "user": user })))
-    })
+        Ok(user)
+    })?;
+    let token = state.issue_session(&user.id);
+    Ok(Json(json!({ "token": token, "user": user })))
 }
 
 async fn logout(State(state): State<AppState>, Extension(auth): Extension<AuthUser>) -> Json<Value> {
-    state.write(|db| {
-        db.sessions.retain(|_, user_id| user_id != &auth.id);
+    state.write_volatile(|db| {
+        db.sessions.remove(&auth.token);
     });
     Json(json!({ "ok": true }))
 }
@@ -200,7 +196,7 @@ async fn reset_password(State(state): State<AppState>, Json(body): Json<ResetBod
         if let Some(account) = db.accounts.iter_mut().find(|a| a.user.id == user_id) {
             account.password_hash = password_hash;
         }
-        db.sessions.retain(|_, owner| owner != &user_id);
+        db.sessions.retain(|_, session| session.user_id != user_id);
     });
     Ok(Json(json!({ "ok": true })))
 }
