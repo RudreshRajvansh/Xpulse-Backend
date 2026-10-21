@@ -6,9 +6,9 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use xpulse_backend::{AppState, create_app};
+use xpulse_backend::{AppState, SeedCredential, SeedPasswords, create_app};
 
-pub const SEED_PASSWORD: &str = "password";
+pub const SEED_PASSWORD: &str = "seed-pass-123";
 pub const PATIENT_PASSWORD: &str = "patient-pass-1";
 
 pub struct Reply {
@@ -24,8 +24,13 @@ pub struct TestApp {
 impl TestApp {
     pub fn new() -> Self {
         TestApp {
-            router: create_app(AppState::ephemeral()),
+            router: create_app(AppState::ephemeral(SeedPasswords::Shared(SEED_PASSWORD.to_string()))),
         }
+    }
+
+    pub fn with_random_seed() -> (Self, Vec<SeedCredential>) {
+        let (state, generated) = AppState::seeded(SeedPasswords::Random);
+        (TestApp { router: create_app(state) }, generated)
     }
 
     pub async fn send(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Reply {

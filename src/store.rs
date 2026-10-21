@@ -24,6 +24,33 @@ pub fn six_digit_code() -> String {
     format!("{:06}", 100_000 + (nanos % 900_000))
 }
 
+pub enum SeedPasswords {
+    Shared(String),
+    Random,
+}
+
+impl SeedPasswords {
+    pub fn from_env() -> Self {
+        match std::env::var("XPULSE_SEED_PASSWORD") {
+            Ok(value) if !value.trim().is_empty() => SeedPasswords::Shared(value),
+            _ => SeedPasswords::Random,
+        }
+    }
+
+    fn next(&self) -> String {
+        match self {
+            SeedPasswords::Shared(value) => value.clone(),
+            SeedPasswords::Random => uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SeedCredential {
+    pub email: String,
+    pub password: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Db {
@@ -62,8 +89,9 @@ impl Db {
         });
     }
 
-    fn seed() -> Self {
+    fn seed(passwords: &SeedPasswords) -> (Self, Vec<SeedCredential>) {
         let mut db = Db::default();
+        let mut generated = Vec::new();
         let staff = [
             ("u_patient", "Aarav Sharma", "patient@xpulse.in", "PATIENT", None),
             ("u_doctor", "Dr. Mehta", "doctor@xpulse.in", "DOCTOR", Some("fac_1")),
@@ -75,6 +103,13 @@ impl Db {
             ("u_customer_care", "Support Desk", "care@xpulse.in", "CUSTOMER_CARE", None),
         ];
         for (id, name, email, role, scope) in staff {
+            let password = passwords.next();
+            if matches!(passwords, SeedPasswords::Random) {
+                generated.push(SeedCredential {
+                    email: email.to_string(),
+                    password: password.clone(),
+                });
+            }
             db.accounts.push(Account {
                 user: User {
                     id: id.to_string(),
@@ -84,7 +119,7 @@ impl Db {
                     scope_id: scope.map(|s| s.to_string()),
                     phone: None,
                 },
-                password_hash: crate::password::hash("password"),
+                password_hash: crate::password::hash(&password),
             });
         }
 
@@ -151,7 +186,7 @@ impl Db {
             completed_at: None,
         });
 
-        db
+        (db, generated)
     }
 }
 
@@ -162,22 +197,32 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn load(path: PathBuf) -> Self {
-        let db = std::fs::read_to_string(&path)
+    pub fn load(path: PathBuf, passwords: SeedPasswords) -> (Self, Vec<SeedCredential>) {
+        let existing = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|raw| serde_json::from_str::<Db>(&raw).ok())
-            .unwrap_or_else(Db::seed);
-        AppState {
+            .and_then(|raw| serde_json::from_str::<Db>(&raw).ok());
+        let (db, generated) = match existing {
+            Some(db) => (db, Vec::new()),
+            None => Db::seed(&passwords),
+        };
+        let state = AppState {
             inner: Arc::new(Mutex::new(db)),
             path: Some(path),
-        }
+        };
+        (state, generated)
     }
 
-    pub fn ephemeral() -> Self {
-        AppState {
-            inner: Arc::new(Mutex::new(Db::seed())),
+    pub fn seeded(passwords: SeedPasswords) -> (Self, Vec<SeedCredential>) {
+        let (db, generated) = Db::seed(&passwords);
+        let state = AppState {
+            inner: Arc::new(Mutex::new(db)),
             path: None,
-        }
+        };
+        (state, generated)
+    }
+
+    pub fn ephemeral(passwords: SeedPasswords) -> Self {
+        Self::seeded(passwords).0
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&Db) -> T) -> T {

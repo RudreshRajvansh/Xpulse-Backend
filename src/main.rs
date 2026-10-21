@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use xpulse_backend::{AppState, create_app, tls};
+use xpulse_backend::{AppState, SeedPasswords, create_app, tls};
 
 #[tokio::main]
 async fn main() {
@@ -8,7 +8,13 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("xpulse-data.json"));
 
-    let state = AppState::load(data_path.clone());
+    let (state, generated) = AppState::load(data_path.clone(), SeedPasswords::from_env());
+    if !generated.is_empty() {
+        println!("seeded demo accounts with generated passwords, set XPULSE_SEED_PASSWORD to choose one:");
+        for credential in &generated {
+            println!("  {}  {}", credential.email, credential.password);
+        }
+    }
     let app = create_app(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
