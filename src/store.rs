@@ -158,7 +158,7 @@ impl Db {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<Db>>,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -169,7 +169,14 @@ impl AppState {
             .unwrap_or_else(Db::seed);
         AppState {
             inner: Arc::new(Mutex::new(db)),
-            path,
+            path: Some(path),
+        }
+    }
+
+    pub fn ephemeral() -> Self {
+        AppState {
+            inner: Arc::new(Mutex::new(Db::seed())),
+            path: None,
         }
     }
 
@@ -181,8 +188,10 @@ impl AppState {
     pub fn write<T>(&self, f: impl FnOnce(&mut Db) -> T) -> T {
         let mut guard = self.inner.lock().expect("store poisoned");
         let out = f(&mut guard);
-        if let Ok(raw) = serde_json::to_string_pretty(&*guard) {
-            let _ = std::fs::write(&self.path, raw);
+        if let Some(path) = &self.path {
+            if let Ok(raw) = serde_json::to_string_pretty(&*guard) {
+                let _ = std::fs::write(path, raw);
+            }
         }
         out
     }
