@@ -71,6 +71,11 @@ pub struct Db {
 }
 
 impl Db {
+    pub fn account_by_email(&self, email: &str) -> Option<&Account> {
+        let wanted = email.trim();
+        self.accounts.iter().find(|a| a.user.email.eq_ignore_ascii_case(wanted))
+    }
+
     pub fn name_of(&self, user_id: &str) -> String {
         self.accounts
             .iter()

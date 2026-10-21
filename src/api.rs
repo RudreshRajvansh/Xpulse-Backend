@@ -67,20 +67,19 @@ struct LoginBody {
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<LoginBody>) -> ApiResult<Json<Value>> {
-    state.write(|db| {
-        let account = db
-            .accounts
-            .iter()
-            .find(|a| {
-                a.user.email.eq_ignore_ascii_case(&body.email)
-                    && password::verify(&body.password, &a.password_hash)
-            })
-            .cloned()
-            .ok_or_else(|| ApiError::Unauthorized("Invalid email or password".into()))?;
+    let account = state.read(|db| db.account_by_email(&body.email).cloned());
+    let stored = account.as_ref().map(|a| a.password_hash.clone());
+    let matched = password::verify_async(body.password, stored).await;
+    let account = match account {
+        Some(account) if matched => account,
+        _ => return Err(ApiError::Unauthorized("Invalid email or password".into())),
+    };
+    let token = state.write(|db| {
         let token = new_id();
         db.sessions.insert(token.clone(), account.user.id.clone());
-        Ok(Json(json!({ "token": token, "user": account.user })))
-    })
+        token
+    });
+    Ok(Json(json!({ "token": token, "user": account.user })))
 }
 
 #[derive(Deserialize)]
@@ -93,8 +92,12 @@ struct RegisterBody {
 }
 
 async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>) -> ApiResult<Json<Value>> {
+    if state.read(|db| db.account_by_email(&body.email).is_some()) {
+        return Err(ApiError::Conflict("An account with this email already exists".into()));
+    }
+    let password_hash = password::hash_async(body.password.clone()).await;
     state.write(|db| {
-        if db.accounts.iter().any(|a| a.user.email.eq_ignore_ascii_case(&body.email)) {
+        if db.account_by_email(&body.email).is_some() {
             return Err(ApiError::Conflict("An account with this email already exists".into()));
         }
         let user = User {
@@ -107,7 +110,7 @@ async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>)
         };
         db.accounts.push(Account {
             user: user.clone(),
-            password_hash: password::hash(&body.password),
+            password_hash,
         });
         let token = new_id();
         db.sessions.insert(token.clone(), user.id.clone());
@@ -644,8 +647,12 @@ async fn create_staff(
     Json(body): Json<CreateStaffBody>,
 ) -> ApiResult<Json<User>> {
     auth.require(&[ROLE_SUPER_ADMIN])?;
+    if state.read(|db| db.account_by_email(&body.email).is_some()) {
+        return Err(ApiError::Conflict("An account with this email already exists".into()));
+    }
+    let password_hash = password::hash_async(body.password.clone()).await;
     state.write(|db| {
-        if db.accounts.iter().any(|a| a.user.email.eq_ignore_ascii_case(&body.email)) {
+        if db.account_by_email(&body.email).is_some() {
             return Err(ApiError::Conflict("An account with this email already exists".into()));
         }
         let user = User {
@@ -658,7 +665,7 @@ async fn create_staff(
         };
         db.accounts.push(Account {
             user: user.clone(),
-            password_hash: password::hash(&body.password),
+            password_hash,
         });
         Ok(Json(user))
     })

@@ -15,6 +15,7 @@ async fn main() {
             println!("  {}  {}", credential.email, credential.password);
         }
     }
+    xpulse_backend::password::warm_up();
     let app = create_app(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
