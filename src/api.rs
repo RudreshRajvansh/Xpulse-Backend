@@ -2,7 +2,7 @@ use crate::auth::*;
 use crate::error::{ApiError, ApiResult};
 use crate::models::*;
 use crate::password;
-use crate::store::{AppState, new_id, now_millis, six_digit_code};
+use crate::store::{AppState, ResetCode, new_id, now_millis, random_code};
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
@@ -125,24 +125,36 @@ async fn logout(State(state): State<AppState>, Extension(auth): Extension<AuthUs
     Json(json!({ "ok": true }))
 }
 
+const RESET_CODE_TTL_MS: i64 = 10 * 60 * 1000;
+const RESET_MAX_ATTEMPTS: u32 = 5;
+const RESET_REQUESTED: &str = "If an account exists for that email, a reset code has been sent.";
+const RESET_REJECTED: &str = "That code is invalid or has expired";
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EmailBody {
     email: String,
 }
 
-async fn request_password_reset(
-    State(state): State<AppState>,
-    Json(body): Json<EmailBody>,
-) -> ApiResult<Json<Value>> {
-    state.write(|db| {
-        if !db.accounts.iter().any(|a| a.user.email.eq_ignore_ascii_case(&body.email)) {
-            return Err(ApiError::NotFound("No account found for this email".into()));
-        }
-        let code = six_digit_code();
-        db.reset_codes.insert(body.email.to_lowercase(), code.clone());
-        Ok(Json(json!({ "code": code })))
-    })
+async fn request_password_reset(State(state): State<AppState>, Json(body): Json<EmailBody>) -> Json<Value> {
+    let email = body.email.trim().to_lowercase();
+    let issued = state.write_volatile(|db| {
+        db.account_by_email(&email)?;
+        let code = random_code();
+        db.reset_codes.insert(
+            email.clone(),
+            ResetCode {
+                code: code.clone(),
+                expires_at: now_millis() + RESET_CODE_TTL_MS,
+                attempts: 0,
+            },
+        );
+        Some(code)
+    });
+    if let (Some(code), Some(sink)) = (issued, &state.config().reset_code_sink) {
+        sink(&email, &code);
+    }
+    Json(json!({ "ok": true, "message": RESET_REQUESTED }))
 }
 
 #[derive(Deserialize)]
@@ -154,25 +166,43 @@ struct ResetBody {
 }
 
 async fn reset_password(State(state): State<AppState>, Json(body): Json<ResetBody>) -> ApiResult<Json<Value>> {
-    state.write(|db| {
-        let key = body.email.to_lowercase();
-        let expected = db
+    let email = body.email.trim().to_lowercase();
+    let otp = body.otp.trim().to_string();
+    let user_id = state.write_volatile(|db| {
+        let now = now_millis();
+        let matched = match db.reset_codes.get_mut(&email) {
+            Some(entry) if entry.expires_at > now && entry.attempts < RESET_MAX_ATTEMPTS => {
+                if entry.code == otp {
+                    true
+                } else {
+                    entry.attempts += 1;
+                    false
+                }
+            }
+            _ => false,
+        };
+        let spent = db
             .reset_codes
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ApiError::InvalidInput("Request a new code".into()))?;
-        if expected != body.otp.trim() {
-            return Err(ApiError::InvalidInput("That code is not correct".into()));
+            .get(&email)
+            .is_some_and(|entry| entry.expires_at <= now || entry.attempts >= RESET_MAX_ATTEMPTS);
+        if matched || spent {
+            db.reset_codes.remove(&email);
         }
-        let account = db
-            .accounts
-            .iter_mut()
-            .find(|a| a.user.email.eq_ignore_ascii_case(&body.email))
-            .ok_or_else(|| ApiError::NotFound("No account found for this email".into()))?;
-        account.password_hash = password::hash(&body.new_password);
-        db.reset_codes.remove(&key);
-        Ok(Json(json!({ "ok": true })))
-    })
+        if !matched {
+            return Err(ApiError::InvalidInput(RESET_REJECTED.into()));
+        }
+        db.account_by_email(&email)
+            .map(|a| a.user.id.clone())
+            .ok_or_else(|| ApiError::InvalidInput(RESET_REJECTED.into()))
+    })?;
+    let password_hash = password::hash_async(body.new_password).await;
+    state.write(|db| {
+        if let Some(account) = db.accounts.iter_mut().find(|a| a.user.id == user_id) {
+            account.password_hash = password_hash;
+        }
+        db.sessions.retain(|_, owner| owner != &user_id);
+    });
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_medicines(
@@ -388,7 +418,7 @@ async fn reception_token(
     auth.require(&[ROLE_RECEPTIONIST])?;
     Ok(Json(state.write(|db| {
         let token = db.reception_token.clone().unwrap_or_else(|| {
-            let fresh = six_digit_code();
+            let fresh = random_code();
             db.reception_token = Some(fresh.clone());
             fresh
         });

@@ -16,12 +16,39 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub fn six_digit_code() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("{:06}", 100_000 + (nanos % 900_000))
+pub fn random_code() -> String {
+    let source = uuid::Uuid::new_v4();
+    let bytes = source.as_bytes();
+    let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    format!("{:06}", 100_000 + value % 900_000)
+}
+
+pub type ResetCodeSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct Config {
+    pub reset_code_sink: Option<ResetCodeSink>,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        let dev_mode = std::env::var("XPULSE_DEV").map(|v| v == "1").unwrap_or(false);
+        let sink: Option<ResetCodeSink> = if dev_mode {
+            Some(Arc::new(|email: &str, code: &str| {
+                println!("password reset code for {email}: {code}");
+            }))
+        } else {
+            None
+        };
+        Config { reset_code_sink: sink }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResetCode {
+    pub code: String,
+    pub expires_at: i64,
+    pub attempts: u32,
 }
 
 pub enum SeedPasswords {
@@ -65,7 +92,8 @@ pub struct Db {
     pub tickets: Vec<SupportTicket>,
     pub profiles: HashMap<String, PatientProfile>,
     pub reports: Vec<MedicalReport>,
-    pub reset_codes: HashMap<String, String>,
+    #[serde(skip)]
+    pub reset_codes: HashMap<String, ResetCode>,
     pub sessions: HashMap<String, String>,
     pub reception_token: Option<String>,
 }
@@ -199,6 +227,7 @@ impl Db {
 pub struct AppState {
     inner: Arc<Mutex<Db>>,
     path: Option<PathBuf>,
+    config: Arc<Config>,
 }
 
 impl AppState {
@@ -213,6 +242,7 @@ impl AppState {
         let state = AppState {
             inner: Arc::new(Mutex::new(db)),
             path: Some(path),
+            config: Arc::new(Config::default()),
         };
         (state, generated)
     }
@@ -222,12 +252,27 @@ impl AppState {
         let state = AppState {
             inner: Arc::new(Mutex::new(db)),
             path: None,
+            config: Arc::new(Config::default()),
         };
         (state, generated)
     }
 
     pub fn ephemeral(passwords: SeedPasswords) -> Self {
         Self::seeded(passwords).0
+    }
+
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = Arc::new(config);
+        self
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn write_volatile<T>(&self, f: impl FnOnce(&mut Db) -> T) -> T {
+        let mut guard = self.inner.lock().expect("store poisoned");
+        f(&mut guard)
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&Db) -> T) -> T {

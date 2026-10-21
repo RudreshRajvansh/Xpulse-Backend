@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use tower_http::cors::{Any, CorsLayer};
 
-pub use store::{AppState, SeedCredential, SeedPasswords};
+pub use store::{AppState, Config, ResetCodeSink, SeedCredential, SeedPasswords};
 
 pub fn create_app(state: AppState) -> Router {
     let cors = CorsLayer::new()

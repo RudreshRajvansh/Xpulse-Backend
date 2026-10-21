@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use xpulse_backend::{AppState, SeedPasswords, create_app, tls};
+use xpulse_backend::{AppState, Config, SeedPasswords, create_app, tls};
 
 #[tokio::main]
 async fn main() {
@@ -16,7 +16,7 @@ async fn main() {
         }
     }
     xpulse_backend::password::warm_up();
-    let app = create_app(state);
+    let app = create_app(state.with_config(Config::from_env()));
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr: SocketAddr = format!("0.0.0.0:{port}")

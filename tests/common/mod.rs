@@ -5,8 +5,21 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
-use xpulse_backend::{AppState, SeedCredential, SeedPasswords, create_app};
+use xpulse_backend::{AppState, Config, SeedCredential, SeedPasswords, create_app};
+
+pub type Inbox = Arc<Mutex<Vec<(String, String)>>>;
+
+pub fn latest_code(inbox: &Inbox, email: &str) -> Option<String> {
+    inbox
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(to, _)| to == email)
+        .map(|(_, code)| code.clone())
+}
 
 pub const SEED_PASSWORD: &str = "seed-pass-123";
 pub const PATIENT_PASSWORD: &str = "patient-pass-1";
@@ -23,9 +36,26 @@ pub struct TestApp {
 
 impl TestApp {
     pub fn new() -> Self {
+        Self::with_config(Config::default())
+    }
+
+    pub fn with_config(config: Config) -> Self {
+        let state = AppState::ephemeral(SeedPasswords::Shared(SEED_PASSWORD.to_string())).with_config(config);
         TestApp {
-            router: create_app(AppState::ephemeral(SeedPasswords::Shared(SEED_PASSWORD.to_string()))),
+            router: create_app(state),
         }
+    }
+
+    pub fn with_inbox() -> (Self, Inbox) {
+        let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
+        let delivered = inbox.clone();
+        let config = Config {
+            reset_code_sink: Some(Arc::new(move |email: &str, code: &str| {
+                delivered.lock().unwrap().push((email.to_string(), code.to_string()));
+            })),
+            ..Config::default()
+        };
+        (Self::with_config(config), inbox)
     }
 
     pub fn with_random_seed() -> (Self, Vec<SeedCredential>) {
