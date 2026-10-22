@@ -3,7 +3,7 @@ use crate::consent::*;
 use crate::error::{ApiError, ApiResult};
 use crate::models::*;
 use crate::password;
-use crate::store::{AppState, ResetCode, new_id, now_millis, random_code};
+use crate::store::{AppState, Db, ResetCode, new_id, now_millis, random_code};
 use crate::validate;
 use axum::{
     Extension, Json, Router,
@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn public_routes() -> Router<AppState> {
     Router::new()
@@ -738,39 +738,119 @@ async fn complete_lab_order(
     })
 }
 
+enum Reach {
+    Platform,
+    Area { area_id: String, facilities: HashSet<String> },
+}
+
+impl Reach {
+    fn of(db: &Db, auth: &AuthUser) -> ApiResult<Reach> {
+        if auth.has_any(&[ROLE_SUPER_ADMIN]) {
+            return Ok(Reach::Platform);
+        }
+        let area_id = auth
+            .scope_id
+            .clone()
+            .filter(|area| db.area_exists(area))
+            .ok_or_else(|| ApiError::Forbidden("Your account is not linked to an area".into()))?;
+        let facilities = db.facilities_in_area(&area_id).into_iter().collect();
+        Ok(Reach::Area { area_id, facilities })
+    }
+
+    fn covers_facility(&self, facility_id: &str) -> bool {
+        match self {
+            Reach::Platform => true,
+            Reach::Area { facilities, .. } => facilities.contains(facility_id),
+        }
+    }
+
+    fn covers_staff(&self, user: &User) -> bool {
+        match self {
+            Reach::Platform => true,
+            Reach::Area { area_id, facilities } => user
+                .scope_id
+                .as_deref()
+                .is_some_and(|scope| scope == area_id || facilities.contains(scope)),
+        }
+    }
+}
+
+fn is_patient(user: &User) -> bool {
+    user.roles.iter().any(|r| r == ROLE_PATIENT)
+}
+
 async fn platform_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<PlatformStats>> {
     auth.require(&[ROLE_ADMIN, ROLE_SUPER_ADMIN])?;
-    Ok(Json(state.read(|db| {
+    state.read(|db| {
+        let reach = Reach::of(db, &auth)?;
         let now = now_millis();
-        PlatformStats {
-            total_users: db.accounts.len(),
-            patients: db
+        let patients: HashSet<&str> = match &reach {
+            Reach::Platform => db
                 .accounts
                 .iter()
-                .filter(|a| a.user.roles.iter().any(|r| r == ROLE_PATIENT))
-                .count(),
-            staff: db
-                .accounts
+                .filter(|a| is_patient(&a.user))
+                .map(|a| a.user.id.as_str())
+                .collect(),
+            Reach::Area { .. } => db
+                .prescriptions
                 .iter()
-                .filter(|a| !a.user.roles.iter().any(|r| r == ROLE_PATIENT))
-                .count(),
-            prescriptions_issued: db.prescriptions.len(),
-            prescriptions_pending: db.prescriptions.iter().filter(|p| !p.fulfilled).count(),
-            lab_orders_open: db.lab_orders.iter().filter(|o| o.status != "COMPLETED").count(),
-            lab_orders_completed: db.lab_orders.iter().filter(|o| o.status == "COMPLETED").count(),
+                .filter(|p| reach.covers_facility(&p.facility_id))
+                .map(|p| p.patient_id.as_str())
+                .chain(
+                    db.lab_orders
+                        .iter()
+                        .filter(|o| reach.covers_facility(&o.facility_id))
+                        .map(|o| o.patient_id.as_str()),
+                )
+                .chain(
+                    db.appointments
+                        .iter()
+                        .filter(|a| reach.covers_facility(&a.facility_id))
+                        .map(|a| a.patient_id.as_str()),
+                )
+                .collect(),
+        };
+        let staff = db
+            .accounts
+            .iter()
+            .filter(|a| !is_patient(&a.user) && reach.covers_staff(&a.user))
+            .count();
+        let grant_in_reach =
+            |g: &&AccessGrant| db.facility_of(&g.grantee_id).is_some_and(|f| reach.covers_facility(&f));
+        let prescriptions: Vec<&Prescription> =
+            db.prescriptions.iter().filter(|p| reach.covers_facility(&p.facility_id)).collect();
+        let labs: Vec<&LabOrder> =
+            db.lab_orders.iter().filter(|o| reach.covers_facility(&o.facility_id)).collect();
+        Ok(Json(PlatformStats {
+            total_users: patients.len() + staff,
+            patients: patients.len(),
+            staff,
+            prescriptions_issued: prescriptions.len(),
+            prescriptions_pending: prescriptions.iter().filter(|p| !p.fulfilled).count(),
+            lab_orders_open: labs.iter().filter(|o| o.status != "COMPLETED").count(),
+            lab_orders_completed: labs.iter().filter(|o| o.status == "COMPLETED").count(),
             active_grants: db
                 .grants
                 .iter()
+                .filter(grant_in_reach)
                 .filter(|g| !g.revoked && g.expires_at > now)
                 .count(),
-            revoked_grants: db.grants.iter().filter(|g| g.revoked).count(),
-            waiting_in_queue: db.appointments.len(),
-            open_tickets: db.tickets.iter().filter(|t| t.status == "OPEN").count(),
-        }
-    })))
+            revoked_grants: db.grants.iter().filter(grant_in_reach).filter(|g| g.revoked).count(),
+            waiting_in_queue: db
+                .appointments
+                .iter()
+                .filter(|a| reach.covers_facility(&a.facility_id))
+                .count(),
+            open_tickets: db
+                .tickets
+                .iter()
+                .filter(|t| t.status == "OPEN" && patients.contains(t.raised_by.as_str()))
+                .count(),
+        }))
+    })
 }
 
 async fn list_users(
@@ -778,7 +858,20 @@ async fn list_users(
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<User>>> {
     auth.require(&[ROLE_ADMIN, ROLE_SUPER_ADMIN])?;
-    Ok(Json(state.read(|db| db.accounts.iter().map(|a| a.user.clone()).collect())))
+    state.read(|db| {
+        let reach = Reach::of(db, &auth)?;
+        let users = db
+            .accounts
+            .iter()
+            .map(|a| &a.user)
+            .filter(|user| match &reach {
+                Reach::Platform => true,
+                Reach::Area { .. } => !is_patient(user) && reach.covers_staff(user),
+            })
+            .cloned()
+            .collect();
+        Ok(Json(users))
+    })
 }
 
 #[derive(Deserialize)]
@@ -804,12 +897,34 @@ async fn create_staff(
     let name = validate::name(&body.name)?;
     let email = validate::email(&body.email)?;
     validate::password(&body.password)?;
-    let scope_id = body
+    let requested = body
         .scope_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let scope_id = state.read(|db| match role.as_str() {
+        ROLE_CUSTOMER_CARE => Ok(None),
+        ROLE_ADMIN => match requested {
+            Some(area) if db.area_exists(&area) => Ok(Some(area)),
+            _ => {
+                let mut areas: Vec<&str> = db.facilities.iter().map(|f| f.area_id.as_str()).collect();
+                areas.sort();
+                areas.dedup();
+                Err(ApiError::InvalidInput(format!(
+                    "An admin needs an existing area: {}",
+                    areas.join(", ")
+                )))
+            }
+        },
+        _ => match requested {
+            Some(facility) if db.facility_exists(&facility) => Ok(Some(facility)),
+            _ => Err(ApiError::InvalidInput(format!(
+                "Staff need an existing facility: {}",
+                db.facilities.iter().map(|f| f.id.as_str()).collect::<Vec<_>>().join(", ")
+            ))),
+        },
+    })?;
     if state.read(|db| db.account_by_email(&email).is_some()) {
         return Err(ApiError::Conflict("An account with this email already exists".into()));
     }
