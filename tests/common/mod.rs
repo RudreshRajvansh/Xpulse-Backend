@@ -115,6 +115,10 @@ impl TestApp {
     }
 
     pub async fn staff_at(&self, role: &str, email: &str, scope: &str) -> String {
+        self.create_staff(role, email, scope).await.1
+    }
+
+    pub async fn create_staff(&self, role: &str, email: &str, scope: &str) -> (String, String) {
         let super_admin = self.login("superadmin@xpulse.in").await;
         let reply = self
             .post(
@@ -131,7 +135,10 @@ impl TestApp {
             .await;
         assert_eq!(reply.status, StatusCode::OK, "staff creation failed: {}", reply.raw);
         let login = self.try_login(email, STAFF_PASSWORD).await;
-        login.body["token"].as_str().unwrap().to_string()
+        (
+            login.body["user"]["id"].as_str().unwrap().to_string(),
+            login.body["token"].as_str().unwrap().to_string(),
+        )
     }
 
     pub async fn register_patient(&self, name: &str, email: &str) -> (String, String) {
