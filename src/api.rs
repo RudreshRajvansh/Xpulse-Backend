@@ -255,6 +255,7 @@ async fn issue_prescription(
     Json(body): Json<IssuePrescriptionBody>,
 ) -> ApiResult<Json<Prescription>> {
     auth.require(&[ROLE_DOCTOR])?;
+    let facility_id = auth.facility()?;
     if body.items.is_empty() || body.items.iter().any(|item| item.name.trim().is_empty()) {
         return Err(ApiError::InvalidInput("Every prescribed item needs a medicine name".into()));
     }
@@ -282,6 +283,7 @@ async fn issue_prescription(
             patient_id: body.patient_id.clone(),
             patient_name: db.name_of(&body.patient_id),
             doctor_id: auth.id.clone(),
+            facility_id,
             items,
             issued_at: now_millis(),
             fulfilled: false,
@@ -485,12 +487,19 @@ async fn reception_token(
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<Value>> {
     auth.require(&[ROLE_RECEPTIONIST])?;
+    let facility_id = auth.facility()?;
     Ok(Json(state.write(|db| {
-        let token = db.reception_token.clone().unwrap_or_else(|| {
-            let fresh = random_code();
-            db.reception_token = Some(fresh.clone());
-            fresh
-        });
+        let token = match db.reception_codes.get(&facility_id) {
+            Some(existing) => existing.clone(),
+            None => {
+                let mut fresh = random_code();
+                while db.reception_codes.values().any(|code| code == &fresh) {
+                    fresh = random_code();
+                }
+                db.reception_codes.insert(facility_id.clone(), fresh.clone());
+                fresh
+            }
+        };
         json!({ "token": token })
     })))
 }
@@ -508,25 +517,36 @@ async fn check_in(
 ) -> ApiResult<Json<Appointment>> {
     auth.require(&[ROLE_PATIENT])?;
     let patient_id = auth.id.clone();
+    let code = body.token.trim().to_string();
     state.write(|db| {
-        let active = db
-            .reception_token
-            .clone()
-            .ok_or_else(|| ApiError::InvalidInput("Reception is not accepting check-ins right now".into()))?;
-        if body.token.trim() != active {
-            return Err(ApiError::InvalidInput("That code does not match the reception desk".into()));
-        }
-        if db.appointments.iter().any(|a| a.patient_id == patient_id) {
+        let facility_id = db
+            .reception_codes
+            .iter()
+            .find(|(_, active)| **active == code)
+            .map(|(facility, _)| facility.clone())
+            .ok_or_else(|| ApiError::InvalidInput("That code does not match any reception desk".into()))?;
+        if db
+            .appointments
+            .iter()
+            .any(|a| a.patient_id == patient_id && a.facility_id == facility_id)
+        {
             return Err(ApiError::Conflict("You are already in the queue".into()));
         }
+        let facility_name = db
+            .facilities
+            .iter()
+            .find(|f| f.id == facility_id)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| facility_id.clone());
         let appointment = Appointment {
             id: new_id(),
             patient_id: patient_id.clone(),
             patient_name: auth.name.clone(),
+            facility_id,
             checked_in_at: now_millis(),
         };
         db.appointments.push(appointment.clone());
-        db.push_audit(&auth, "Checked in at the front desk", &patient_id);
+        db.push_audit(&auth, &format!("Checked in at {facility_name}"), &patient_id);
         Ok(Json(appointment))
     })
 }
@@ -574,6 +594,7 @@ async fn order_lab_test(
     Json(body): Json<OrderLabBody>,
 ) -> ApiResult<Json<LabOrder>> {
     auth.require(&[ROLE_DOCTOR])?;
+    let facility_id = auth.facility()?;
     let test_name = body.test_name.trim().to_string();
     if test_name.is_empty() {
         return Err(ApiError::InvalidInput("Name the test to order".into()));
@@ -586,6 +607,7 @@ async fn order_lab_test(
             patient_name: db.name_of(&body.patient_id),
             test_name: test_name.clone(),
             ordered_by: auth.id.clone(),
+            facility_id,
             ordered_at: now_millis(),
             status: "ORDERED".to_string(),
             result_summary: None,

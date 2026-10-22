@@ -13,6 +13,14 @@ pub struct User {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Facility {
+    pub id: String,
+    pub name: String,
+    pub area_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Account {
     pub user: User,
     pub password_hash: String,
@@ -35,6 +43,8 @@ pub struct Prescription {
     pub patient_id: String,
     pub patient_name: String,
     pub doctor_id: String,
+    #[serde(default)]
+    pub facility_id: String,
     pub items: Vec<Medicine>,
     pub issued_at: i64,
     pub fulfilled: bool,
@@ -70,6 +80,8 @@ pub struct Appointment {
     pub id: String,
     pub patient_id: String,
     pub patient_name: String,
+    #[serde(default)]
+    pub facility_id: String,
     pub checked_in_at: i64,
 }
 
@@ -81,6 +93,8 @@ pub struct LabOrder {
     pub patient_name: String,
     pub test_name: String,
     pub ordered_by: String,
+    #[serde(default)]
+    pub facility_id: String,
     pub ordered_at: i64,
     pub status: String,
     pub result_summary: Option<String>,

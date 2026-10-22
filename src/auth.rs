@@ -30,10 +30,18 @@ pub struct AuthUser {
     pub id: String,
     pub name: String,
     pub roles: Vec<String>,
+    pub scope_id: Option<String>,
     pub token: String,
 }
 
 impl AuthUser {
+    pub fn facility(&self) -> Result<String, ApiError> {
+        self.scope_id
+            .clone()
+            .filter(|scope| !scope.trim().is_empty())
+            .ok_or_else(|| ApiError::Forbidden("Your account is not linked to a facility".into()))
+    }
+
     pub fn has_any(&self, allowed: &[&str]) -> bool {
         self.roles.iter().any(|r| allowed.contains(&r.as_str()))
     }
@@ -82,6 +90,7 @@ pub async fn require_auth(
                 id: a.user.id.clone(),
                 name: a.user.name.clone(),
                 roles: a.user.roles.clone(),
+                scope_id: a.user.scope_id.clone(),
                 token: token.clone(),
             })
     });

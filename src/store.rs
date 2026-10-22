@@ -124,10 +124,34 @@ pub struct Db {
     pub reset_codes: HashMap<String, ResetCode>,
     #[serde(skip)]
     pub sessions: HashMap<String, Session>,
-    pub reception_token: Option<String>,
+    pub facilities: Vec<Facility>,
+    pub reception_codes: HashMap<String, String>,
 }
 
 impl Db {
+    pub fn facility_exists(&self, facility_id: &str) -> bool {
+        self.facilities.iter().any(|f| f.id == facility_id)
+    }
+
+    pub fn area_exists(&self, area_id: &str) -> bool {
+        self.facilities.iter().any(|f| f.area_id == area_id)
+    }
+
+    pub fn facilities_in_area(&self, area_id: &str) -> Vec<String> {
+        self.facilities
+            .iter()
+            .filter(|f| f.area_id == area_id)
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    pub fn facility_of(&self, user_id: &str) -> Option<String> {
+        self.accounts
+            .iter()
+            .find(|a| a.user.id == user_id)
+            .and_then(|a| a.user.scope_id.clone())
+            .filter(|scope| self.facility_exists(scope))
+    }
     pub fn active_grant(&self, patient_id: &str, grantee_id: &str, scope: &str) -> Option<&AccessGrant> {
         let now = now_millis();
         self.grants.iter().find(|g| {
@@ -166,6 +190,17 @@ impl Db {
     fn seed(passwords: &SeedPasswords) -> (Self, Vec<SeedCredential>) {
         let mut db = Db::default();
         let mut generated = Vec::new();
+        for (id, name, area) in [
+            ("fac_1", "City Care Clinic", "area_1"),
+            ("fac_2", "Sunrise Clinic", "area_1"),
+            ("fac_3", "Lakeview Hospital", "area_2"),
+        ] {
+            db.facilities.push(Facility {
+                id: id.to_string(),
+                name: name.to_string(),
+                area_id: area.to_string(),
+            });
+        }
         let staff = [
             ("u_patient", "Aarav Sharma", "patient@xpulse.in", "PATIENT", None),
             ("u_doctor", "Dr. Mehta", "doctor@xpulse.in", "DOCTOR", Some("fac_1")),
@@ -243,6 +278,7 @@ impl Db {
             patient_name: "Aarav Sharma".to_string(),
             test_name: "HbA1c".to_string(),
             ordered_by: "u_doctor".to_string(),
+            facility_id: "fac_1".to_string(),
             ordered_at: now - 86_400_000,
             status: "COMPLETED".to_string(),
             result_summary: Some("6.8% · slightly above target range".to_string()),
@@ -255,6 +291,7 @@ impl Db {
             test_name: "Lipid Profile".to_string(),
             ordered_at: now - 3_600_000,
             ordered_by: "u_doctor".to_string(),
+            facility_id: "fac_1".to_string(),
             status: "ORDERED".to_string(),
             result_summary: None,
             completed_at: None,
