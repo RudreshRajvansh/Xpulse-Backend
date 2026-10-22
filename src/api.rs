@@ -298,8 +298,14 @@ async fn pending_prescriptions(
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<Prescription>>> {
     auth.require(&[ROLE_PHARMACY])?;
+    let facility_id = auth.facility()?;
     Ok(Json(state.read(|db| {
-        let mut items: Vec<Prescription> = db.prescriptions.iter().filter(|p| !p.fulfilled).cloned().collect();
+        let mut items: Vec<Prescription> = db
+            .prescriptions
+            .iter()
+            .filter(|p| !p.fulfilled && p.facility_id == facility_id)
+            .cloned()
+            .collect();
         items.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
         items
     })))
@@ -311,12 +317,16 @@ async fn fulfill_prescription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Prescription>> {
     auth.require(&[ROLE_PHARMACY])?;
+    let facility_id = auth.facility()?;
     state.write(|db| {
         let index = db
             .prescriptions
             .iter()
-            .position(|p| p.id == id)
+            .position(|p| p.id == id && p.facility_id == facility_id)
             .ok_or_else(|| ApiError::NotFound("Prescription not found".into()))?;
+        if db.prescriptions[index].fulfilled {
+            return Err(ApiError::Conflict("Prescription already dispensed".into()));
+        }
         db.prescriptions[index].fulfilled = true;
         let updated = db.prescriptions[index].clone();
         db.push_audit(&auth, "Dispensed a prescription", &updated.patient_id);
@@ -556,8 +566,14 @@ async fn queue(
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<Appointment>>> {
     auth.require(&[ROLE_RECEPTIONIST, ROLE_DOCTOR])?;
+    let facility_id = auth.facility()?;
     Ok(Json(state.read(|db| {
-        let mut items = db.appointments.clone();
+        let mut items: Vec<Appointment> = db
+            .appointments
+            .iter()
+            .filter(|a| a.facility_id == facility_id)
+            .cloned()
+            .collect();
         items.sort_by(|a, b| a.checked_in_at.cmp(&b.checked_in_at));
         items
     })))
@@ -569,11 +585,12 @@ async fn admit(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Appointment>> {
     auth.require(&[ROLE_RECEPTIONIST])?;
+    let facility_id = auth.facility()?;
     state.write(|db| {
         let index = db
             .appointments
             .iter()
-            .position(|a| a.id == id)
+            .position(|a| a.id == id && a.facility_id == facility_id)
             .ok_or_else(|| ApiError::NotFound("Appointment not found".into()))?;
         let appointment = db.appointments.remove(index);
         db.push_audit(&auth, "Admitted for consultation", &appointment.patient_id);
@@ -624,8 +641,14 @@ async fn all_lab_orders(
     Extension(auth): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<LabOrder>>> {
     auth.require(&[ROLE_DIAGNOSTIC])?;
+    let facility_id = auth.facility()?;
     Ok(Json(state.read(|db| {
-        let mut items = db.lab_orders.clone();
+        let mut items: Vec<LabOrder> = db
+            .lab_orders
+            .iter()
+            .filter(|o| o.facility_id == facility_id)
+            .cloned()
+            .collect();
         items.sort_by(|a, b| {
             let done_a = a.status == "COMPLETED";
             let done_b = b.status == "COMPLETED";
@@ -654,11 +677,12 @@ async fn collect_sample(
     Path(id): Path<String>,
 ) -> ApiResult<Json<LabOrder>> {
     auth.require(&[ROLE_DIAGNOSTIC])?;
+    let facility_id = auth.facility()?;
     state.write(|db| {
         let index = db
             .lab_orders
             .iter()
-            .position(|o| o.id == id)
+            .position(|o| o.id == id && o.facility_id == facility_id)
             .ok_or_else(|| ApiError::NotFound("Lab order not found".into()))?;
         if db.lab_orders[index].status != "ORDERED" {
             return Err(ApiError::Conflict("Sample already collected".into()));
@@ -688,11 +712,12 @@ async fn complete_lab_order(
 ) -> ApiResult<Json<LabOrder>> {
     auth.require(&[ROLE_DIAGNOSTIC])?;
     let summary = validate::required(&body.result_summary, "Result summary", 2000)?;
+    let facility_id = auth.facility()?;
     state.write(|db| {
         let index = db
             .lab_orders
             .iter()
-            .position(|o| o.id == id)
+            .position(|o| o.id == id && o.facility_id == facility_id)
             .ok_or_else(|| ApiError::NotFound("Lab order not found".into()))?;
         if db.lab_orders[index].status == "COMPLETED" {
             return Err(ApiError::Conflict("Report already published".into()));
