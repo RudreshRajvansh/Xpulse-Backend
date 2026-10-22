@@ -23,6 +23,7 @@ pub fn latest_code(inbox: &Inbox, email: &str) -> Option<String> {
 
 pub const SEED_PASSWORD: &str = "seed-pass-123";
 pub const PATIENT_PASSWORD: &str = "patient-pass-1";
+pub const STAFF_PASSWORD: &str = "staff-pass-1";
 
 pub struct Reply {
     pub status: StatusCode,
@@ -111,6 +112,26 @@ impl TestApp {
         let reply = self.try_login(email, SEED_PASSWORD).await;
         assert_eq!(reply.status, StatusCode::OK, "login failed for {email}: {}", reply.raw);
         reply.body["token"].as_str().unwrap().to_string()
+    }
+
+    pub async fn staff_at(&self, role: &str, email: &str, scope: &str) -> String {
+        let super_admin = self.login("superadmin@xpulse.in").await;
+        let reply = self
+            .post(
+                "/admin/staff",
+                Some(&super_admin),
+                json!({
+                    "name": format!("{role} {scope}"),
+                    "email": email,
+                    "password": STAFF_PASSWORD,
+                    "role": role,
+                    "scopeId": scope,
+                }),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "staff creation failed: {}", reply.raw);
+        let login = self.try_login(email, STAFF_PASSWORD).await;
+        login.body["token"].as_str().unwrap().to_string()
     }
 
     pub async fn register_patient(&self, name: &str, email: &str) -> (String, String) {
