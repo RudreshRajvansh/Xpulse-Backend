@@ -1,32 +1,34 @@
-# XPulse Backend
+# XPulse backend
 
-Rust + axum API server for XPulse, a consent-first personal health record built on ABDM rails.
+Rust (axum) API behind the XPulse Android app. XPulse is a personal health record built on ABDM, where patients decide who gets to see their data.
 
-Run with `cargo run` (listens on `PORT`, default 3000). Run the integration suite with `cargo test`.
+`cargo run` starts it on `PORT` (3000 if unset). `cargo test` runs the integration tests.
 
-| Variable | Purpose |
+| Variable | What it does |
 | --- | --- |
-| `XPULSE_SEED_PASSWORD` | Password for the seeded demo accounts. If unset, each account gets a random password, printed once when the store is created. |
-| `XPULSE_SESSION_TTL_SECS` | Session lifetime. Default 43200 (12 hours). |
-| `XPULSE_DEV` | Set to `1` to print password reset codes to the server log. No email or SMS provider is wired in yet. |
+| `XPULSE_SEED_PASSWORD` | Password for the demo accounts. If it's unset, each account gets a random password, printed once when the data file is first created. |
+| `XPULSE_SESSION_TTL_SECS` | How long a login lasts. Defaults to 43200 (12 hours). |
+| `XPULSE_DEV` | Set to `1` to print password reset codes in the server log. There's no email or SMS provider yet. |
 
-## Who can read what
+## Access rules
 
-A patient always has full access to their own record. Nobody else can read it without a live consent grant from that patient, and a grant only opens the scopes the patient chose: `Medicines`, `Allergies`, `Profile`, `LabResults`, `Reports`.
+Patients can always read their own record. Anyone else needs a grant from that patient, and a grant only covers what the patient picked: `Medicines`, `Allergies`, `Profile`, `LabResults`, `Reports`. Only a patient can create a grant, only for a doctor, and for 24 hours at most. Revoking takes effect on the next request. Reads under a grant go into the patient's audit log, and so do refused attempts.
 
-| Record | Patient | Doctor | Any other role |
+| Record | Patient | Doctor | Other roles |
 | --- | --- | --- | --- |
-| Medicines, allergies, profile, lab results, reports | Own | Only with a live grant covering that scope | Never |
-| Audit log, support tickets, care suggestions | Own | Never | Never |
+| Medicines, allergies, profile, lab results, reports | Own | With a grant covering it | No |
+| Audit log, support tickets, care suggestions | Own | No | No |
 
-Grants can only be issued by the patient, only to a doctor, and last at most 24 hours. Revoking takes effect on the next request. Every read under consent, and every refused attempt, is written to the patient's audit log under the signed-in user's id.
+Staff accounts belong to a facility. Admins belong to an area, which is a group of facilities. Work queues only show the caller's own facility, and anything from another facility returns 404.
 
-| Role | Can act on |
+| Role | Sees and acts on |
 | --- | --- |
-| Doctor | Grants issued to them, and the waiting queue. Prescribing needs a `Medicines` grant, ordering labs needs a `LabResults` grant. |
-| Pharmacy | The pending prescription queue: patient name and prescribed items. |
-| Diagnostics | The lab order queue: patient name, test, status and result. |
-| Receptionist | The check-in code, waiting queue and admitting patients. |
-| Customer care | The support ticket queue. |
-| Admin | Platform counts and the user directory. |
-| Super admin | Everything admin can, plus creating staff accounts. Cannot create super admins. |
+| Doctor | Grants addressed to them, plus their facility's waiting queue. Prescribing needs a `Medicines` grant and ordering a lab needs `LabResults`. |
+| Pharmacy | Undispensed prescriptions written at its facility (patient name and items) |
+| Diagnostics | Lab orders placed at its facility |
+| Receptionist | Its facility's check-in code and waiting queue |
+| Customer care | All support tickets. This role isn't tied to a facility. |
+| Admin | Staff list and activity counts for the facilities in its area |
+| Super admin | The whole platform. Can create staff accounts, but not other super admins. |
+
+The seed data has three facilities: `fac_1` and `fac_2` in `area_1`, and `fac_3` in `area_2`. All demo staff accounts are in `fac_1`.
